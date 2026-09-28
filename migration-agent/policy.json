@@ -1,0 +1,22 @@
+{
+  "researchPolicy": {
+    "minimumConfidence": 0.8,
+    "requiredIndependentSources": 2,
+    "preferOfficialSources": true,
+    "allowMajorVersionMigration": false,
+    "stopWhenCompatibilityIsUnclear": true
+  },
+  "trustedDomains": [
+    "maven.apache.org",
+    "central.sonatype.com",
+    "search.maven.org",
+    "github.com",
+    "spring.io",
+    "springdoc.org"
+  ],
+  "limits": {
+    "maximumSearchQueries": 6,
+    "maximumCandidateVersions": 5,
+    "requestTimeoutSeconds": 20
+  }
+}
