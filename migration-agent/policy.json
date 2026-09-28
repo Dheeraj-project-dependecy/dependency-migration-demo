@@ -1,22 +1,30 @@
 {
-  "researchPolicy": {
-    "minimumConfidence": 0.8,
-    "requiredIndependentSources": 2,
-    "preferOfficialSources": true,
-    "allowMajorVersionMigration": false,
-    "stopWhenCompatibilityIsUnclear": true
+  "agentName": "Self-Healing Legacy Dependency Migration Agent",
+  "version": "1.0.0",
+  "executionMode": "ANALYSIS_ONLY",
+
+  "allowAutomaticChanges": false,
+  "allowBranchCreation": false,
+  "allowPullRequestCreation": false,
+
+  "minimumResearchSources": 2,
+  "minimumConfidenceScore": 0.8,
+
+  "supportedPlatforms": {
+    "java": [
+      "8"
+    ],
+    "springBoot": [
+      "1.5"
+    ]
   },
-  "trustedDomains": [
-    "maven.apache.org",
-    "central.sonatype.com",
-    "search.maven.org",
-    "github.com",
-    "spring.io",
-    "springdoc.org"
-  ],
-  "limits": {
-    "maximumSearchQueries": 6,
-    "maximumCandidateVersions": 5,
-    "requestTimeoutSeconds": 20
+
+  "reports": {
+    "generateBuildAnalysis": true,
+    "generatePomScan": true,
+    "generateDependencyScan": true,
+    "generateCompatibilityReport": true,
+    "generateMigrationPlan": true,
+    "generateFinalReport": true
   }
 }

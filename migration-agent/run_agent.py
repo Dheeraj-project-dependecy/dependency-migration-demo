@@ -1,15 +1,15 @@
 """
 Dependency Migration Agent Orchestrator.
 
-Runs the analysis and framework modules sequentially.
+Runs all framework stages sequentially.
 
-Current phase:
-- Analysis only
-- Planning only
-- No dependency modifications
-- No Git branch creation
-- No source-code modifications
-- No pull-request creation
+Current execution mode:
+- analysis only
+- planning only
+- no dependency modifications
+- no Git branch creation
+- no source-code changes
+- no pull-request creation
 """
 
 import json
@@ -21,6 +21,7 @@ from pathlib import Path
 AGENT_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = AGENT_ROOT.parent
 REPORTS_ROOT = AGENT_ROOT / "reports"
+POLICY_FILE = AGENT_ROOT / "policy.json"
 
 
 STEPS = [
@@ -86,14 +87,69 @@ STEPS = [
 ]
 
 
+def load_policy():
+    """Load and validate policy.json."""
+
+    if not POLICY_FILE.exists():
+        raise FileNotFoundError(
+            "Agent policy file was not found: {}".format(
+                POLICY_FILE
+            )
+        )
+
+    if not POLICY_FILE.is_file():
+        raise ValueError(
+            "Agent policy path is not a file: {}".format(
+                POLICY_FILE
+            )
+        )
+
+    try:
+        policy = json.loads(
+            POLICY_FILE.read_text(encoding="utf-8")
+        )
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            "Agent policy contains invalid JSON: {}".format(
+                error
+            )
+        )
+
+    required_fields = [
+        "agentName",
+        "version",
+        "executionMode",
+        "allowAutomaticChanges",
+        "allowBranchCreation",
+        "allowPullRequestCreation",
+    ]
+
+    missing_fields = [
+        field_name
+        for field_name in required_fields
+        if field_name not in policy
+    ]
+
+    if missing_fields:
+        raise ValueError(
+            "Agent policy is missing fields: {}".format(
+                ", ".join(missing_fields)
+            )
+        )
+
+    return policy
+
+
 def build_command(step):
-    """Build the Python command for one agent step."""
+    """Build the Python command for one agent stage."""
 
     script_path = AGENT_ROOT / step["script"]
 
     if not script_path.exists():
         raise FileNotFoundError(
-            "Agent module was not found: {}".format(script_path)
+            "Agent module was not found: {}".format(
+                script_path
+            )
         )
 
     command = [
@@ -107,7 +163,7 @@ def build_command(step):
 
 
 def execute_step(step_number, total_steps, step):
-    """Execute one agent module and return its result."""
+    """Execute one agent stage and return its result."""
 
     print()
     print("-" * 60)
@@ -137,9 +193,7 @@ def execute_step(step_number, total_steps, step):
                 step["name"]
             )
         )
-        print(
-            "Reason: {}".format(error)
-        )
+        print("Reason: {}".format(error))
 
         return {
             "name": step["name"],
@@ -154,9 +208,7 @@ def execute_step(step_number, total_steps, step):
                 step["name"]
             )
         )
-        print(
-            "Reason: {}".format(error)
-        )
+        print("Reason: {}".format(error))
 
         return {
             "name": step["name"],
@@ -201,7 +253,7 @@ def execute_step(step_number, total_steps, step):
 
 
 def load_json_report(report_name):
-    """Load a report if it exists and contains valid JSON."""
+    """Load a generated JSON report if available."""
 
     report_path = REPORTS_ROOT / report_name
 
@@ -210,28 +262,89 @@ def load_json_report(report_name):
 
     try:
         return json.loads(
-            report_path.read_text(
-                encoding="utf-8"
-            )
+            report_path.read_text(encoding="utf-8")
         )
-
     except json.JSONDecodeError:
         return None
 
 
-def print_final_summary(step_results):
-    """Print the final agent-execution summary."""
+def print_startup(policy):
+    """Print policy-driven agent startup information."""
+
+    agent_name = policy.get(
+        "agentName",
+        "Dependency Migration Agent",
+    )
+
+    print("=" * 60)
+    print(agent_name.upper())
+    print("=" * 60)
+    print(
+        "Agent name          : {}".format(
+            agent_name
+        )
+    )
+    print(
+        "Agent version       : {}".format(
+            policy.get("version")
+        )
+    )
+    print(
+        "Execution mode      : {}".format(
+            policy.get("executionMode")
+        )
+    )
+    print(
+        "Automatic changes   : {}".format(
+            policy.get("allowAutomaticChanges")
+        )
+    )
+    print(
+        "Branch creation     : {}".format(
+            policy.get("allowBranchCreation")
+        )
+    )
+    print(
+        "Pull request        : {}".format(
+            policy.get("allowPullRequestCreation")
+        )
+    )
+    print(
+        "Research sources    : {}".format(
+            policy.get("minimumResearchSources")
+        )
+    )
+    print(
+        "Confidence threshold: {}".format(
+            policy.get("minimumConfidenceScore")
+        )
+    )
+    print(
+        "Project root        : {}".format(
+            PROJECT_ROOT
+        )
+    )
+    print(
+        "Agent root          : {}".format(
+            AGENT_ROOT
+        )
+    )
+
+
+def print_final_summary(step_results, policy):
+    """Print the final agent execution summary."""
 
     migration_plan = load_json_report(
         "migration-plan.json"
     )
-
     remediation_report = load_json_report(
         "remediation-report.json"
     )
-
     branch_report = load_json_report(
         "branch-report.json"
+    )
+    final_report = load_json_report(
+        "final-agent-report.json"
     )
 
     successful_steps = [
@@ -250,13 +363,21 @@ def print_final_summary(step_results):
     print("=" * 60)
     print("AGENT EXECUTION SUMMARY")
     print("=" * 60)
-
+    print(
+        "Agent version       : {}".format(
+            policy.get("version")
+        )
+    )
+    print(
+        "Execution mode      : {}".format(
+            policy.get("executionMode")
+        )
+    )
     print(
         "Successful steps    : {}".format(
             len(successful_steps)
         )
     )
-
     print(
         "Failed steps        : {}".format(
             len(failed_steps)
@@ -266,12 +387,9 @@ def print_final_summary(step_results):
     if migration_plan:
         print(
             "Plan status         : {}".format(
-                migration_plan.get(
-                    "planStatus"
-                )
+                migration_plan.get("planStatus")
             )
         )
-
         print(
             "Automatic changes   : {}".format(
                 migration_plan.get(
@@ -280,7 +398,6 @@ def print_final_summary(step_results):
                 )
             )
         )
-
         print(
             "Branch creation     : {}".format(
                 migration_plan.get(
@@ -289,7 +406,6 @@ def print_final_summary(step_results):
                 )
             )
         )
-
         print(
             "Migration candidates: {}".format(
                 migration_plan.get(
@@ -305,9 +421,7 @@ def print_final_summary(step_results):
     if remediation_report:
         print(
             "Remediation status  : {}".format(
-                remediation_report.get(
-                    "status"
-                )
+                remediation_report.get("status")
             )
         )
 
@@ -320,12 +434,21 @@ def print_final_summary(step_results):
                 )
             )
         )
-
         print(
             "Branch name         : {}".format(
-                branch_report.get(
-                    "branchName"
-                )
+                branch_report.get("branchName")
+            )
+        )
+
+    if final_report:
+        print(
+            "Final agent status  : {}".format(
+                final_report.get("agentStatus")
+            )
+        )
+        print(
+            "Final next step     : {}".format(
+                final_report.get("nextStep")
             )
         )
 
@@ -349,10 +472,11 @@ def print_final_summary(step_results):
 
 
 def validate_environment():
-    """Validate the files required before agent execution."""
+    """Validate files required before execution."""
 
     required_files = [
         PROJECT_ROOT / "pom.xml",
+        POLICY_FILE,
         REPORTS_ROOT / "maven-build.log",
     ]
 
@@ -380,25 +504,20 @@ def validate_environment():
 def main():
     """Run the complete agent framework sequentially."""
 
-    print("=" * 60)
-    print("DEPENDENCY MIGRATION AGENT")
-    print("=" * 60)
-
-    print(
-        "Project root        : {}".format(
-            PROJECT_ROOT
+    try:
+        policy = load_policy()
+    except (FileNotFoundError, ValueError) as error:
+        print("=" * 60)
+        print("DEPENDENCY MIGRATION AGENT")
+        print("=" * 60)
+        print(
+            "Unable to load policy: {}".format(
+                error
+            )
         )
-    )
+        return 2
 
-    print(
-        "Agent root          : {}".format(
-            AGENT_ROOT
-        )
-    )
-
-    print(
-        "Execution mode      : ANALYSIS_ONLY"
-    )
+    print_startup(policy)
 
     REPORTS_ROOT.mkdir(
         parents=True,
@@ -411,7 +530,6 @@ def main():
             "Agent execution stopped because required "
             "input files are missing."
         )
-
         return 2
 
     total_steps = len(STEPS)
@@ -440,7 +558,10 @@ def main():
                 )
             )
 
-            print_final_summary(step_results)
+            print_final_summary(
+                step_results,
+                policy,
+            )
 
             return result["exitCode"] or 1
 
@@ -449,7 +570,10 @@ def main():
     print("AGENT EXECUTION COMPLETE")
     print("=" * 60)
 
-    print_final_summary(step_results)
+    print_final_summary(
+        step_results,
+        policy,
+    )
 
     return 0
 

@@ -1,17 +1,8 @@
-# Python
 __pycache__/
 *.pyc
 
-# Agent-generated reports
 migration-agent/reports/*
 !migration-agent/reports/.gitkeep
 
-# Maven
-target/
-
-# Generated Maven diagnostics
 effective-pom.xml
-
-# Secrets
-.env
-*.token
+target/
