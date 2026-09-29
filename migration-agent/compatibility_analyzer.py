@@ -1,16 +1,20 @@
 """
-Analyze project-platform constraints for dependency migration research.
+Evaluate dependency replacement candidates against project-platform constraints.
 
 Inputs:
-- pom-scan.json
-- dependency-research.json
+- migration-agent/reports/pom-scan.json
+- migration-agent/reports/dependency-research.json
+- migration-agent/policy.json
 
 Output:
-- compatibility-report.json
+- migration-agent/reports/compatibility-report.json
 
-This phase is scan-only. It establishes compatibility constraints but does
-not select or modify any dependency. Candidate-specific compatibility checks
-will be added after internet research provides candidate metadata.
+Version 1.1 functionality:
+- Detect Java, Spring Boot, Spring Framework, and namespace constraints.
+- Evaluate replacement candidates produced by dependency_researcher.py.
+- Select a compatible SpringDoc v1 replacement for the legacy demo platform.
+- Keep unknown dependencies pending for future internet research.
+- Never modify pom.xml, source code, tests, or Git branches.
 """
 
 import argparse
@@ -19,15 +23,64 @@ import re
 from pathlib import Path
 
 
-def load_json(file_path, description):
+AGENT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = AGENT_ROOT.parent
+DEFAULT_POM_SCAN = AGENT_ROOT / "reports" / "pom-scan.json"
+DEFAULT_RESEARCH_REPORT = AGENT_ROOT / "reports" / "dependency-research.json"
+DEFAULT_POLICY = AGENT_ROOT / "policy.json"
+DEFAULT_OUTPUT = AGENT_ROOT / "reports" / "compatibility-report.json"
+
+
+# Temporary compatibility catalog for the functional MVP.
+# Later, dependency_researcher.py will populate these facts from trusted
+# internet sources and this catalog can be removed.
+COMPATIBILITY_CATALOG = {
+    "org.springdoc:springdoc-openapi-ui": [
+        {
+            "version": "1.8.0",
+            "minimumJava": 8,
+            "maximumJava": None,
+            "supportedSpringBootMajors": [1, 2],
+            "namespace": "javax",
+            "status": "COMPATIBLE_LINE_ARCHIVED",
+            "evidence": [
+                {
+                    "type": "OFFICIAL_DOCUMENTATION",
+                    "url": "https://springdoc.org/v1/",
+                    "claim": (
+                        "SpringDoc v1 supports Spring Boot 1 and 2 and "
+                        "documents springdoc-openapi-ui version 1.8.0."
+                    ),
+                },
+                {
+                    "type": "OFFICIAL_MIGRATION_GUIDE",
+                    "url": (
+                        "https://springdoc.org/v1/"
+                        "migrating-from-springfox.html"
+                    ),
+                    "claim": (
+                        "Remove Springfox dependencies, add "
+                        "springdoc-openapi-ui 1.8.0, and migrate Swagger 2 "
+                        "annotations to OpenAPI 3 annotations."
+                    ),
+                },
+            ],
+        }
+    ]
+}
+
+
+def load_json(file_path, description, required=True):
     """Load and validate a JSON file."""
 
     path = Path(file_path).resolve()
 
     if not path.exists():
-        raise FileNotFoundError(
-            "{} was not found: {}".format(description, path)
-        )
+        if required:
+            raise FileNotFoundError(
+                "{} was not found: {}".format(description, path)
+            )
+        return {}
 
     if not path.is_file():
         raise ValueError(
@@ -43,7 +96,7 @@ def load_json(file_path, description):
 
 
 def normalize_java_version(value):
-    """Convert Java version strings such as 1.8 or 21 into a major number."""
+    """Convert Java version strings such as 1.8 or 21 to major numbers."""
 
     if value is None:
         return None
@@ -64,43 +117,51 @@ def normalize_java_version(value):
     return None
 
 
-def parse_version_numbers(value):
-    """Extract numeric version components without assuming SemVer compliance."""
+def version_major(value):
+    """Return the first numeric component from a version string."""
 
     if value is None:
-        return []
+        return None
 
-    return [
-        int(number)
-        for number in re.findall(r"\d+", str(value))
-    ]
+    match = re.search(r"\d+", str(value))
+
+    if not match:
+        return None
+
+    return int(match.group(0))
 
 
-def major_version(value):
-    """Return the first numeric version component."""
+def find_resolved_dependency_version(research_report, identifier):
+    """Find a resolved dependency version in the research candidates."""
 
-    numbers = parse_version_numbers(value)
-
-    if numbers:
-        return numbers[0]
+    for candidate in research_report.get("candidates", []):
+        if candidate.get("identifier") == identifier:
+            return candidate.get("version")
 
     return None
 
 
-def detect_namespace_constraint(java_major, spring_boot_major):
-    """Infer the namespace generation expected by the current platform."""
+def find_spring_framework_version(pom_scan, research_report):
+    """Find Spring Framework version from properties or resolved dependencies."""
 
-    if spring_boot_major is not None and spring_boot_major >= 3:
-        return "jakarta"
+    properties = pom_scan.get("properties", {})
 
-    if java_major is not None or spring_boot_major is not None:
-        return "javax"
+    configured = (
+        properties.get("spring.version")
+        or properties.get("spring-framework.version")
+    )
 
-    return "unknown"
+    if configured:
+        return configured
+
+    return find_resolved_dependency_version(
+        research_report,
+        "org.springframework:spring-core",
+    )
 
 
-def extract_platform(pom_scan):
-    """Extract Java and framework constraints from the POM scan."""
+def extract_platform(pom_scan, research_report):
+    """Extract the project platform used for compatibility decisions."""
 
     platform = pom_scan.get("platform", {})
     java_info = platform.get("javaVersion", {})
@@ -108,16 +169,19 @@ def extract_platform(pom_scan):
 
     java_value = java_info.get("value")
     spring_boot_value = spring_boot_info.get("version")
+    spring_framework_value = find_spring_framework_version(
+        pom_scan,
+        research_report,
+    )
 
     java_major = normalize_java_version(java_value)
-    spring_boot_major = major_version(spring_boot_value)
+    spring_boot_major = version_major(spring_boot_value)
+    spring_framework_major = version_major(spring_framework_value)
 
-    properties = pom_scan.get("properties", {})
+    namespace = "unknown"
 
-    spring_framework_value = (
-        properties.get("spring.version")
-        or properties.get("spring-framework.version")
-    )
+    if spring_boot_major is not None:
+        namespace = "jakarta" if spring_boot_major >= 3 else "javax"
 
     return {
         "java": {
@@ -132,34 +196,25 @@ def extract_platform(pom_scan):
         },
         "springFramework": {
             "configuredVersion": spring_framework_value,
-            "majorVersion": major_version(spring_framework_value),
+            "majorVersion": spring_framework_major,
         },
-        "namespace": detect_namespace_constraint(
-            java_major,
-            spring_boot_major,
-        ),
+        "namespace": namespace,
     }
 
 
-def build_constraints(platform):
-    """Create constraints that internet-researched candidates must satisfy."""
+def build_constraints(platform, policy):
+    """Build mandatory constraints from platform and policy information."""
 
+    constraints = []
     java_major = platform.get("java", {}).get("majorVersion")
     spring_boot_major = platform.get("springBoot", {}).get("majorVersion")
     namespace = platform.get("namespace")
-
-    constraints = []
 
     if java_major is not None:
         constraints.append(
             {
                 "name": "java-runtime",
-                "operator": "supports",
                 "requiredValue": java_major,
-                "description": (
-                    "Replacement must support Java {} or lower runtime "
-                    "requirements compatible with the project."
-                ).format(java_major),
                 "mandatory": True,
             }
         )
@@ -168,11 +223,7 @@ def build_constraints(platform):
         constraints.append(
             {
                 "name": "spring-boot-generation",
-                "operator": "compatible-with",
                 "requiredValue": spring_boot_major,
-                "description": (
-                    "Replacement must explicitly support Spring Boot {}.x."
-                ).format(spring_boot_major),
                 "mandatory": True,
             }
         )
@@ -181,11 +232,7 @@ def build_constraints(platform):
         constraints.append(
             {
                 "name": "java-ee-namespace",
-                "operator": "uses",
                 "requiredValue": namespace,
-                "description": (
-                    "Replacement must be compatible with the {} namespace."
-                ).format(namespace),
                 "mandatory": True,
             }
         )
@@ -194,31 +241,19 @@ def build_constraints(platform):
         [
             {
                 "name": "artifact-availability",
-                "operator": "exists-in",
-                "requiredValue": "Maven Central or configured repository",
-                "description": (
-                    "The exact replacement artifact and version must be "
-                    "available from an approved Maven repository."
-                ),
+                "requiredValue": True,
                 "mandatory": True,
             },
             {
                 "name": "official-compatibility-evidence",
-                "operator": "minimum-count",
                 "requiredValue": 1,
-                "description": (
-                    "At least one official source must confirm platform "
-                    "compatibility or provide migration guidance."
-                ),
                 "mandatory": True,
             },
             {
-                "name": "total-research-evidence",
-                "operator": "minimum-count",
-                "requiredValue": 2,
-                "description": (
-                    "At least two trustworthy sources must support an "
-                    "automatic migration recommendation."
+                "name": "minimum-confidence",
+                "requiredValue": policy.get(
+                    "minimumConfidenceScore",
+                    0.8,
                 ),
                 "mandatory": True,
             },
@@ -228,85 +263,360 @@ def build_constraints(platform):
     return constraints
 
 
-def prepare_candidate_checks(research_report, constraints):
-    """Attach pending compatibility checks to each research candidate."""
+def evaluate_catalog_entry(catalog_entry, platform):
+    """Evaluate one exact replacement version against project constraints."""
 
-    candidates = research_report.get("candidates", [])
-    candidate_checks = []
+    checks = []
+    rejection_reasons = []
 
-    check_names = [
-        constraint.get("name")
-        for constraint in constraints
-        if constraint.get("mandatory")
-    ]
+    java_major = platform.get("java", {}).get("majorVersion")
+    boot_major = platform.get("springBoot", {}).get("majorVersion")
+    namespace = platform.get("namespace")
 
-    for candidate in candidates:
-        candidate_checks.append(
-            {
-                "identifier": candidate.get("identifier"),
-                "currentVersion": candidate.get("version"),
-                "scope": candidate.get("scope"),
-                "compatibilityStatus": "PENDING_RESEARCH",
-                "actionable": False,
-                "requiredChecks": [
-                    {
-                        "name": check_name,
-                        "status": "PENDING",
-                        "evidence": [],
-                    }
-                    for check_name in check_names
-                ],
-                "replacementCandidates": [],
-                "rejectionReasons": [],
-            }
-        )
+    minimum_java = catalog_entry.get("minimumJava")
+    maximum_java = catalog_entry.get("maximumJava")
 
-    return candidate_checks
-
-
-def create_report(pom_scan, research_report):
-    """Create the platform compatibility baseline report."""
-
-    platform = extract_platform(pom_scan)
-    constraints = build_constraints(platform)
-    candidate_checks = prepare_candidate_checks(
-        research_report,
-        constraints,
+    java_passed = (
+        java_major is not None
+        and minimum_java is not None
+        and java_major >= minimum_java
+        and (maximum_java is None or java_major <= maximum_java)
     )
 
-    unresolved_platform_values = []
+    checks.append(
+        {
+            "name": "java-runtime",
+            "status": "PASSED" if java_passed else "FAILED",
+            "required": {
+                "minimum": minimum_java,
+                "maximum": maximum_java,
+            },
+            "actual": java_major,
+        }
+    )
 
-    if platform.get("java", {}).get("majorVersion") is None:
-        unresolved_platform_values.append("javaVersion")
+    if not java_passed:
+        rejection_reasons.append(
+            "Replacement does not support the configured Java version."
+        )
 
-    if platform.get("springBoot", {}).get("majorVersion") is None:
-        unresolved_platform_values.append("springBootVersion")
+    supported_boot = catalog_entry.get("supportedSpringBootMajors", [])
+    boot_passed = boot_major in supported_boot
 
-    platform_status = (
-        "READY"
-        if not unresolved_platform_values
-        else "INCOMPLETE"
+    checks.append(
+        {
+            "name": "spring-boot-generation",
+            "status": "PASSED" if boot_passed else "FAILED",
+            "required": supported_boot,
+            "actual": boot_major,
+        }
+    )
+
+    if not boot_passed:
+        rejection_reasons.append(
+            "Replacement does not support Spring Boot {}.x.".format(
+                boot_major
+            )
+        )
+
+    required_namespace = catalog_entry.get("namespace")
+    namespace_passed = namespace == required_namespace
+
+    checks.append(
+        {
+            "name": "java-ee-namespace",
+            "status": "PASSED" if namespace_passed else "FAILED",
+            "required": required_namespace,
+            "actual": namespace,
+        }
+    )
+
+    if not namespace_passed:
+        rejection_reasons.append(
+            "Replacement namespace is not compatible with the project."
+        )
+
+    evidence = catalog_entry.get("evidence", [])
+    evidence_passed = len(evidence) >= 1
+
+    checks.append(
+        {
+            "name": "official-compatibility-evidence",
+            "status": "PASSED" if evidence_passed else "FAILED",
+            "required": 1,
+            "actual": len(evidence),
+            "evidence": evidence,
+        }
+    )
+
+    if not evidence_passed:
+        rejection_reasons.append(
+            "No official compatibility evidence was recorded."
+        )
+
+    compatible = all(
+        check.get("status") == "PASSED"
+        for check in checks
     )
 
     return {
-        "analysisStatus": "BASELINE_COMPLETE",
-        "platformStatus": platform_status,
+        "version": catalog_entry.get("version"),
+        "status": "COMPATIBLE" if compatible else "INCOMPATIBLE",
+        "catalogStatus": catalog_entry.get("status"),
+        "checks": checks,
+        "evidence": evidence,
+        "rejectionReasons": rejection_reasons,
+    }
+
+
+def evaluate_replacement(replacement, platform):
+    """Evaluate one replacement coordinate and select a compatible version."""
+
+    identifier = replacement.get("identifier")
+    catalog_versions = COMPATIBILITY_CATALOG.get(identifier, [])
+
+    if not catalog_versions:
+        return {
+            "identifier": identifier,
+            "groupId": replacement.get("groupId"),
+            "artifactId": replacement.get("artifactId"),
+            "requestedVersion": replacement.get("version"),
+            "selectedVersion": None,
+            "status": "PENDING_INTERNET_RESEARCH",
+            "checks": [],
+            "evidence": [],
+            "reason": (
+                "No compatibility metadata is available for this replacement."
+            ),
+        }
+
+    requested_version = replacement.get("version")
+    evaluations = []
+
+    for catalog_entry in catalog_versions:
+        if (
+            requested_version is not None
+            and catalog_entry.get("version") != requested_version
+        ):
+            continue
+
+        evaluation = evaluate_catalog_entry(
+            catalog_entry,
+            platform,
+        )
+        evaluations.append(evaluation)
+
+    compatible_evaluations = [
+        evaluation
+        for evaluation in evaluations
+        if evaluation.get("status") == "COMPATIBLE"
+    ]
+
+    if compatible_evaluations:
+        selected = compatible_evaluations[0]
+
+        return {
+            "identifier": identifier,
+            "groupId": replacement.get("groupId"),
+            "artifactId": replacement.get("artifactId"),
+            "requestedVersion": requested_version,
+            "selectedVersion": selected.get("version"),
+            "status": "COMPATIBLE",
+            "checks": selected.get("checks", []),
+            "evidence": selected.get("evidence", []),
+            "reason": (
+                "A compatible replacement version was selected for the "
+                "current Java, Spring Boot, and namespace constraints."
+            ),
+        }
+
+    return {
+        "identifier": identifier,
+        "groupId": replacement.get("groupId"),
+        "artifactId": replacement.get("artifactId"),
+        "requestedVersion": requested_version,
+        "selectedVersion": None,
+        "status": "INCOMPATIBLE",
+        "checks": evaluations,
+        "evidence": [],
+        "reason": (
+            "No catalog version satisfies the current project constraints."
+        ),
+    }
+
+
+def evaluate_candidate(candidate, platform, policy):
+    """Evaluate all replacement options for one existing dependency."""
+
+    identifier = candidate.get("identifier")
+    research_status = candidate.get("researchStatus")
+    replacements = candidate.get("replacementCandidates", [])
+    confidence = candidate.get("confidence", 0.0)
+    minimum_confidence = policy.get("minimumConfidenceScore", 0.8)
+
+    result = {
+        "identifier": identifier,
+        "currentVersion": candidate.get("version"),
+        "scope": candidate.get("scope"),
+        "researchStatus": research_status,
+        "migrationRequired": candidate.get("migrationRequired", False),
+        "maintenanceStatus": candidate.get(
+            "maintenanceStatus",
+            "UNKNOWN",
+        ),
+        "researchConfidence": confidence,
+        "minimumConfidenceRequired": minimum_confidence,
+        "compatibilityStatus": "PENDING_RESEARCH",
+        "actionable": False,
+        "selectedReplacement": None,
+        "replacementCandidates": [],
+        "requiredChecks": [],
+        "rejectionReasons": [],
+    }
+
+    if research_status != "COMPLETE":
+        result["rejectionReasons"].append(
+            "Dependency research is not complete."
+        )
+        return result
+
+    if candidate.get("migrationRequired") is not True:
+        result["compatibilityStatus"] = "NOT_REQUIRED"
+        return result
+
+    if confidence < minimum_confidence:
+        result["compatibilityStatus"] = "INSUFFICIENT_CONFIDENCE"
+        result["rejectionReasons"].append(
+            "Research confidence is below the configured threshold."
+        )
+        return result
+
+    if not replacements:
+        result["compatibilityStatus"] = "NO_REPLACEMENT_FOUND"
+        result["rejectionReasons"].append(
+            "No replacement candidates were discovered."
+        )
+        return result
+
+    evaluated_replacements = [
+        evaluate_replacement(replacement, platform)
+        for replacement in replacements
+    ]
+
+    result["replacementCandidates"] = evaluated_replacements
+
+    compatible_replacements = [
+        replacement
+        for replacement in evaluated_replacements
+        if replacement.get("status") == "COMPATIBLE"
+    ]
+
+    if not compatible_replacements:
+        if any(
+            replacement.get("status") == "PENDING_INTERNET_RESEARCH"
+            for replacement in evaluated_replacements
+        ):
+            result["compatibilityStatus"] = "PENDING_RESEARCH"
+        else:
+            result["compatibilityStatus"] = "INCOMPATIBLE"
+
+        result["rejectionReasons"].append(
+            "No compatible replacement version was selected."
+        )
+        return result
+
+    selected = compatible_replacements[0]
+    result["compatibilityStatus"] = "COMPATIBLE"
+    result["actionable"] = True
+    result["selectedReplacement"] = {
+        "groupId": selected.get("groupId"),
+        "artifactId": selected.get("artifactId"),
+        "identifier": selected.get("identifier"),
+        "version": selected.get("selectedVersion"),
+    }
+    result["requiredChecks"] = selected.get("checks", [])
+
+    return result
+
+
+def create_report(pom_scan, research_report, policy):
+    """Create the functional candidate compatibility report."""
+
+    platform = extract_platform(pom_scan, research_report)
+    constraints = build_constraints(platform, policy)
+
+    candidate_checks = [
+        evaluate_candidate(candidate, platform, policy)
+        for candidate in research_report.get("candidates", [])
+    ]
+
+    compatible_candidates = [
+        candidate
+        for candidate in candidate_checks
+        if candidate.get("compatibilityStatus") == "COMPATIBLE"
+    ]
+
+    pending_candidates = [
+        candidate
+        for candidate in candidate_checks
+        if candidate.get("compatibilityStatus") == "PENDING_RESEARCH"
+    ]
+
+    incompatible_candidates = [
+        candidate
+        for candidate in candidate_checks
+        if candidate.get("compatibilityStatus") == "INCOMPATIBLE"
+    ]
+
+    migration_candidates = [
+        candidate
+        for candidate in candidate_checks
+        if candidate.get("migrationRequired") is True
+    ]
+
+    all_migration_candidates_compatible = (
+        len(migration_candidates) > 0
+        and all(
+            candidate.get("compatibilityStatus") == "COMPATIBLE"
+            for candidate in migration_candidates
+        )
+    )
+
+    platform_ready = (
+        platform.get("java", {}).get("majorVersion") is not None
+        and platform.get("springBoot", {}).get("majorVersion") is not None
+        and platform.get("namespace") != "unknown"
+    )
+
+    return {
+        "analysisStatus": "COMPLETE",
+        "platformStatus": "READY" if platform_ready else "INCOMPLETE",
         "platform": platform,
         "constraints": constraints,
         "candidateCount": len(candidate_checks),
+        "migrationCandidateCount": len(migration_candidates),
+        "compatibleCandidateCount": len(compatible_candidates),
+        "pendingCandidateCount": len(pending_candidates),
+        "incompatibleCandidateCount": len(incompatible_candidates),
         "candidateChecks": candidate_checks,
-        "unresolvedPlatformValues": unresolved_platform_values,
-        "internetResearchRequired": True,
-        "automaticMigrationAllowed": False,
+        "allMigrationCandidatesCompatible": (
+            all_migration_candidates_compatible
+        ),
+        "automaticMigrationAllowed": (
+            platform_ready
+            and all_migration_candidates_compatible
+            and policy.get("allowAutomaticChanges", False)
+        ),
         "nextStep": (
-            "Research candidate versions and official compatibility "
-            "evidence before evaluating automatic migration."
+            "Pass compatible replacement selections to migration_planner.py."
+            if all_migration_candidates_compatible
+            else "Complete missing research or resolve incompatibilities."
         ),
     }
 
 
 def write_report(report, output_file):
-    """Write the compatibility baseline as formatted JSON."""
+    """Write compatibility-report.json."""
 
     output_path = Path(output_file).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -318,43 +628,48 @@ def write_report(report, output_file):
 
 
 def print_summary(report, report_path):
-    """Print a concise compatibility baseline summary."""
+    """Print the functional compatibility summary."""
 
     platform = report.get("platform", {})
-    java_data = platform.get("java", {})
-    spring_boot_data = platform.get("springBoot", {})
 
     print("=" * 60)
-    print("DEPENDENCY COMPATIBILITY BASELINE")
+    print("DEPENDENCY COMPATIBILITY ANALYSIS")
     print("=" * 60)
-    print(
-        "Platform status     : {}".format(
-            report.get("platformStatus")
-        )
-    )
+    print("Platform status     : {}".format(report.get("platformStatus")))
     print(
         "Java version        : {}".format(
-            java_data.get("configuredVersion")
+            platform.get("java", {}).get("configuredVersion")
         )
     )
     print(
         "Spring Boot version : {}".format(
-            spring_boot_data.get("configuredVersion")
+            platform.get("springBoot", {}).get("configuredVersion")
+        )
+    )
+    print("Namespace           : {}".format(platform.get("namespace")))
+    print(
+        "Migration candidates: {}".format(
+            report.get("migrationCandidateCount", 0)
         )
     )
     print(
-        "Namespace           : {}".format(
-            platform.get("namespace")
+        "Compatible          : {}".format(
+            report.get("compatibleCandidateCount", 0)
         )
     )
     print(
-        "Constraints         : {}".format(
-            len(report.get("constraints", []))
+        "Pending research    : {}".format(
+            report.get("pendingCandidateCount", 0)
         )
     )
     print(
-        "Candidates pending  : {}".format(
-            report.get("candidateCount", 0)
+        "Incompatible        : {}".format(
+            report.get("incompatibleCandidateCount", 0)
+        )
+    )
+    print(
+        "All migration ready : {}".format(
+            report.get("allMigrationCandidatesCompatible")
         )
     )
     print(
@@ -362,35 +677,55 @@ def print_summary(report, report_path):
             report.get("automaticMigrationAllowed")
         )
     )
-    print(
-        "Report              : {}".format(
-            report_path
-        )
-    )
+
+    print("Selected replacements:")
+
+    selected = [
+        candidate
+        for candidate in report.get("candidateChecks", [])
+        if candidate.get("selectedReplacement")
+    ]
+
+    if selected:
+        for candidate in selected:
+            replacement = candidate.get("selectedReplacement", {})
+            print(
+                "  - {} -> {}:{}".format(
+                    candidate.get("identifier"),
+                    replacement.get("identifier"),
+                    replacement.get("version"),
+                )
+            )
+    else:
+        print("  - None")
+
+    print("Report              : {}".format(report_path))
 
 
 def main():
     """Command-line entry point."""
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Prepare platform compatibility constraints for dependency "
-            "migration research."
-        )
+        description="Evaluate migration-candidate compatibility."
     )
     parser.add_argument(
         "--pom-scan",
-        default="migration-agent/reports/pom-scan.json",
+        default=str(DEFAULT_POM_SCAN),
         help="Path to pom-scan.json.",
     )
     parser.add_argument(
         "--research",
-        default="migration-agent/reports/dependency-research.json",
+        default=str(DEFAULT_RESEARCH_REPORT),
         help="Path to dependency-research.json.",
     )
     parser.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY),
+        help="Path to policy.json.",
+    )
+    parser.add_argument(
         "--output",
-        default="migration-agent/reports/compatibility-report.json",
+        default=str(DEFAULT_OUTPUT),
         help="Path for compatibility-report.json.",
     )
 
@@ -402,7 +737,13 @@ def main():
             args.research,
             "Dependency research report",
         )
-        report = create_report(pom_scan, research_report)
+        policy = load_json(
+            args.policy,
+            "Agent policy",
+            required=False,
+        )
+
+        report = create_report(pom_scan, research_report, policy)
         report_path = write_report(report, args.output)
         print_summary(report, report_path)
         return 0
@@ -413,9 +754,7 @@ def main():
 
     except Exception as error:
         print(
-            "Unexpected compatibility analyzer error: {}".format(
-                error
-            )
+            "Unexpected compatibility analyzer error: {}".format(error)
         )
         return 3
 

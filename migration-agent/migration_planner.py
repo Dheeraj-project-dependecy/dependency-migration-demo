@@ -1,17 +1,23 @@
 """
-Create a safe draft migration plan from agent analysis reports.
+Create a concrete dependency migration plan from agent analysis reports.
 
 Inputs:
 - build-analysis.json
 - pom-scan.json
 - dependency-research.json
 - compatibility-report.json
+- policy.json
 
 Output:
 - migration-plan.json
 
-This phase is planning-only. It does not modify dependencies, source files,
-tests, Git branches, or remote repositories.
+Version 1.1 behavior:
+- Keeps a healthy build in NO_ACTION_BUILD_HEALTHY state.
+- Uses compatible replacements selected by compatibility_analyzer.py.
+- Consolidates multiple old dependencies that share one replacement.
+- Permits remediation only for a confirmed dependency-related build failure.
+- Applies policy controls before allowing changes or branch creation.
+- Does not directly modify files or execute Git commands.
 """
 
 import argparse
@@ -19,8 +25,17 @@ import json
 from pathlib import Path
 
 
+AGENT_ROOT = Path(__file__).resolve().parent
+DEFAULT_BUILD_ANALYSIS = AGENT_ROOT / "reports" / "build-analysis.json"
+DEFAULT_POM_SCAN = AGENT_ROOT / "reports" / "pom-scan.json"
+DEFAULT_RESEARCH = AGENT_ROOT / "reports" / "dependency-research.json"
+DEFAULT_COMPATIBILITY = AGENT_ROOT / "reports" / "compatibility-report.json"
+DEFAULT_POLICY = AGENT_ROOT / "policy.json"
+DEFAULT_OUTPUT = AGENT_ROOT / "reports" / "migration-plan.json"
+
+
 def load_json(file_path, description, required=True):
-    """Load a JSON report, optionally allowing a missing report."""
+    """Load and validate a JSON file."""
 
     path = Path(file_path).resolve()
 
@@ -29,7 +44,7 @@ def load_json(file_path, description, required=True):
             raise FileNotFoundError(
                 "{} was not found: {}".format(description, path)
             )
-        return None
+        return {}
 
     if not path.is_file():
         raise ValueError(
@@ -44,121 +59,168 @@ def load_json(file_path, description, required=True):
         )
 
 
-def index_compatibility_checks(compatibility_report):
-    """Index compatibility entries by dependency identifier."""
+def index_research_candidates(research_report):
+    """Index dependency research candidates by identifier."""
 
-    indexed_checks = {}
-
-    if compatibility_report is None:
-        return indexed_checks
-
-    for candidate in compatibility_report.get("candidateChecks", []):
-        identifier = candidate.get("identifier")
-
-        if identifier:
-            indexed_checks[identifier] = candidate
-
-    return indexed_checks
+    return {
+        candidate.get("identifier"): candidate
+        for candidate in research_report.get("candidates", [])
+        if candidate.get("identifier")
+    }
 
 
-def determine_candidate_action(candidate, compatibility_check):
-    """Determine the safe planning action for a candidate."""
+def build_candidate_plans(research_report, compatibility_report):
+    """Build concrete candidate plans from compatibility selections."""
 
-    research_status = candidate.get("researchStatus", "PENDING")
-    maintenance_status = candidate.get("maintenanceStatus", "UNKNOWN")
-    replacements = candidate.get("replacementCandidates", [])
+    research_index = index_research_candidates(research_report)
+    candidate_plans = []
 
-    compatibility_status = "NOT_EVALUATED"
-
-    if compatibility_check:
-        compatibility_status = compatibility_check.get(
+    for compatibility in compatibility_report.get("candidateChecks", []):
+        identifier = compatibility.get("identifier")
+        research = research_index.get(identifier, {})
+        selected_replacement = compatibility.get("selectedReplacement")
+        compatibility_status = compatibility.get(
             "compatibilityStatus",
             "PENDING_RESEARCH",
         )
-
-    if research_status != "COMPLETE":
-        return "RESEARCH_REQUIRED"
-
-    if not replacements:
-        return "NO_REPLACEMENT_CONFIRMED"
-
-    if compatibility_status != "COMPATIBLE":
-        return "COMPATIBILITY_VALIDATION_REQUIRED"
-
-    if maintenance_status in ["DEPRECATED", "ARCHIVED", "UNMAINTAINED"]:
-        return "READY_FOR_REVIEW"
-
-    return "HUMAN_REVIEW_REQUIRED"
-
-
-def create_candidate_plan(candidate, compatibility_check):
-    """Create one safe, non-actionable migration candidate entry."""
-
-    identifier = candidate.get("identifier")
-
-    plan = {
-        "dependency": identifier,
-        "currentVersion": candidate.get("version"),
-        "scope": candidate.get("scope"),
-        "researchStatus": candidate.get("researchStatus", "PENDING"),
-        "maintenanceStatus": candidate.get("maintenanceStatus", "UNKNOWN"),
-        "latestKnownVersion": candidate.get("latestKnownVersion"),
-        "replacementCandidates": candidate.get("replacementCandidates", []),
-        "researchSources": candidate.get("sources", []),
-        "researchConfidence": candidate.get("confidence", 0.0),
-        "compatibilityStatus": (
-            compatibility_check.get("compatibilityStatus")
-            if compatibility_check
-            else "NOT_EVALUATED"
-        ),
-        "requiredChecks": (
-            compatibility_check.get("requiredChecks", [])
-            if compatibility_check
-            else []
-        ),
-        "action": determine_candidate_action(
-            candidate,
-            compatibility_check,
-        ),
-        "automaticChangeAllowed": False,
-    }
-
-    return plan
-
-
-def select_candidates(research_report, compatibility_report):
-    """Build candidate plans without hard-coded dependency rules."""
-
-    candidates = research_report.get("candidates", [])
-    compatibility_index = index_compatibility_checks(
-        compatibility_report
-    )
-    plans = []
-
-    for candidate in candidates:
-        identifier = candidate.get("identifier")
-        compatibility_check = compatibility_index.get(identifier)
-
-        plans.append(
-            create_candidate_plan(
-                candidate,
-                compatibility_check,
-            )
+        migration_required = compatibility.get(
+            "migrationRequired",
+            research.get("migrationRequired", False),
         )
 
-    return plans
+        if not migration_required:
+            action = "NO_MIGRATION_REQUIRED"
+        elif compatibility_status == "COMPATIBLE" and selected_replacement:
+            action = "REPLACE"
+        elif compatibility_status == "INCOMPATIBLE":
+            action = "INCOMPATIBLE_REPLACEMENT"
+        elif compatibility_status == "INSUFFICIENT_CONFIDENCE":
+            action = "RESEARCH_CONFIDENCE_TOO_LOW"
+        elif compatibility_status == "NO_REPLACEMENT_FOUND":
+            action = "NO_REPLACEMENT_CONFIRMED"
+        else:
+            action = "RESEARCH_REQUIRED"
+
+        candidate_plans.append(
+            {
+                "dependency": identifier,
+                "currentVersion": compatibility.get(
+                    "currentVersion",
+                    research.get("version"),
+                ),
+                "scope": compatibility.get(
+                    "scope",
+                    research.get("scope"),
+                ),
+                "maintenanceStatus": compatibility.get(
+                    "maintenanceStatus",
+                    research.get("maintenanceStatus", "UNKNOWN"),
+                ),
+                "migrationRequired": migration_required,
+                "researchStatus": compatibility.get(
+                    "researchStatus",
+                    research.get("researchStatus", "PENDING"),
+                ),
+                "researchConfidence": compatibility.get(
+                    "researchConfidence",
+                    research.get("confidence", 0.0),
+                ),
+                "compatibilityStatus": compatibility_status,
+                "selectedReplacement": selected_replacement,
+                "action": action,
+                "migrationNotes": research.get("migrationNotes", []),
+                "researchSources": research.get("sources", []),
+                "compatibilityChecks": compatibility.get(
+                    "requiredChecks",
+                    [],
+                ),
+                "rejectionReasons": compatibility.get(
+                    "rejectionReasons",
+                    [],
+                ),
+                "automaticChangeAllowed": False,
+            }
+        )
+
+    return candidate_plans
+
+
+def consolidate_replacements(candidate_plans):
+    """Group old dependencies that share the same selected replacement."""
+
+    grouped = {}
+
+    for candidate in candidate_plans:
+        if candidate.get("action") != "REPLACE":
+            continue
+
+        replacement = candidate.get("selectedReplacement") or {}
+        replacement_identifier = replacement.get("identifier")
+        replacement_version = replacement.get("version")
+
+        if not replacement_identifier or not replacement_version:
+            continue
+
+        key = "{}:{}".format(
+            replacement_identifier,
+            replacement_version,
+        )
+
+        if key not in grouped:
+            grouped[key] = {
+                "action": "REPLACE",
+                "currentDependencies": [],
+                "replacement": {
+                    "groupId": replacement.get("groupId"),
+                    "artifactId": replacement.get("artifactId"),
+                    "identifier": replacement_identifier,
+                    "version": replacement_version,
+                },
+                "requiredSourceChanges": [],
+                "confidence": 1.0,
+            }
+
+        grouped[key]["currentDependencies"].append(
+            {
+                "identifier": candidate.get("dependency"),
+                "version": candidate.get("currentVersion"),
+                "scope": candidate.get("scope"),
+            }
+        )
+
+        grouped[key]["confidence"] = min(
+            grouped[key]["confidence"],
+            candidate.get("researchConfidence", 0.0),
+        )
+
+        for note in candidate.get("migrationNotes", []):
+            if note not in grouped[key]["requiredSourceChanges"]:
+                grouped[key]["requiredSourceChanges"].append(note)
+
+    return list(grouped.values())
 
 
 def summarize_actions(candidate_plans):
-    """Count candidates by planning action."""
+    """Count candidate-plan actions."""
 
-    action_counts = {}
+    summary = {}
 
     for candidate in candidate_plans:
         action = candidate.get("action", "UNKNOWN")
-        action_counts[action] = action_counts.get(action, 0) + 1
+        summary[action] = summary.get(action, 0) + 1
 
-    return action_counts
+    return summary
+
+
+def determine_failure_confirmation(build_analysis):
+    """Determine whether a dependency-related failure is confirmed."""
+
+    return (
+        build_analysis.get("buildStatus") == "FAILED"
+        and build_analysis.get("classification") == "dependency_related"
+        and build_analysis.get("confidence") in ["HIGH", "MEDIUM"]
+        and build_analysis.get("verificationRequired") is True
+    )
 
 
 def create_plan(
@@ -166,8 +228,9 @@ def create_plan(
     pom_scan,
     research_report,
     compatibility_report,
+    policy,
 ):
-    """Combine reports into a safe draft migration plan."""
+    """Create the migration plan and apply safety gates."""
 
     build_status = build_analysis.get("buildStatus", "UNKNOWN")
     build_classification = build_analysis.get(
@@ -175,77 +238,120 @@ def create_plan(
         "unknown",
     )
 
-    platform = pom_scan.get("platform", {})
-    java_info = platform.get("javaVersion", {})
-    spring_boot_info = platform.get("springBoot", {})
-
-    candidate_plans = select_candidates(
+    candidate_plans = build_candidate_plans(
         research_report,
         compatibility_report,
     )
+    replacement_groups = consolidate_replacements(candidate_plans)
+    action_summary = summarize_actions(candidate_plans)
 
-    action_counts = summarize_actions(candidate_plans)
-
-    dependency_failure_confirmed = (
-        build_status == "FAILED"
-        and build_classification == "dependency_related"
-        and build_analysis.get("actionable") is True
-    )
-
-    compatibility_ready = (
-        compatibility_report is not None
-        and compatibility_report.get("platformStatus") == "READY"
-    )
-
-    internet_research_complete = (
-        research_report.get("internetResearchPerformed") is True
-        and research_report.get("researchStatus") == "COMPLETE"
-    )
-
-    ready_candidates = [
+    migration_candidates = [
         candidate
         for candidate in candidate_plans
-        if candidate.get("action") == "READY_FOR_REVIEW"
+        if candidate.get("migrationRequired") is True
+    ]
+    compatible_candidates = [
+        candidate
+        for candidate in migration_candidates
+        if candidate.get("action") == "REPLACE"
     ]
 
-    automatic_changes_allowed = (
-        dependency_failure_confirmed
-        and compatibility_ready
-        and internet_research_complete
-        and len(ready_candidates) > 0
+    all_migration_candidates_compatible = (
+        len(migration_candidates) > 0
+        and len(compatible_candidates) == len(migration_candidates)
+        and compatibility_report.get(
+            "allMigrationCandidatesCompatible"
+        ) is True
+    )
+
+    dependency_failure_confirmed = determine_failure_confirmation(
+        build_analysis
+    )
+
+    policy_allows_changes = policy.get(
+        "allowAutomaticChanges",
+        False,
+    )
+    policy_allows_branch = policy.get(
+        "allowBranchCreation",
+        False,
     )
 
     if build_status == "SUCCESS":
         plan_status = "NO_ACTION_BUILD_HEALTHY"
+        remediation_eligible = False
         next_step = "Stop. The daily build is healthy."
     elif build_classification != "dependency_related":
         plan_status = "NO_ACTION_NON_DEPENDENCY_FAILURE"
+        remediation_eligible = False
         next_step = (
-            "Generate a diagnostic report. Do not create a dependency "
-            "migration branch."
+            "Report the non-dependency build failure. Do not modify "
+            "dependencies."
         )
-    elif not internet_research_complete:
-        plan_status = "DRAFT_RESEARCH_REQUIRED"
+    elif not dependency_failure_confirmed:
+        plan_status = "DEPENDENCY_FAILURE_VERIFICATION_REQUIRED"
+        remediation_eligible = False
         next_step = (
-            "Complete trusted internet research and compatibility evidence "
-            "before proposing any dependency change."
+            "Verify the suspected dependency failure before remediation."
         )
-    elif not ready_candidates:
-        plan_status = "DRAFT_NO_VERIFIED_REPLACEMENT"
+    elif not migration_candidates:
+        plan_status = "NO_MIGRATION_CANDIDATE"
+        remediation_eligible = False
         next_step = (
-            "No verified compatible replacement is ready. Escalate for "
-            "human review."
+            "No migration candidate was identified. Escalate for review."
+        )
+    elif not all_migration_candidates_compatible:
+        plan_status = "COMPATIBILITY_VALIDATION_REQUIRED"
+        remediation_eligible = False
+        next_step = (
+            "Complete dependency research or resolve compatibility failures."
         )
     else:
-        plan_status = "READY_FOR_HUMAN_REVIEW"
+        plan_status = "READY_FOR_REMEDIATION"
+        remediation_eligible = True
         next_step = (
-            "Review evidence. A later remediation phase may create an "
-            "isolated feature branch after policy approval."
+            "Create an isolated feature branch and apply the planned "
+            "dependency and source-code changes."
         )
+
+    automatic_changes_allowed = (
+        remediation_eligible
+        and policy_allows_changes
+    )
+    branch_creation_allowed = (
+        automatic_changes_allowed
+        and policy_allows_branch
+    )
+
+    for candidate in candidate_plans:
+        candidate["automaticChangeAllowed"] = (
+            automatic_changes_allowed
+            and candidate.get("action") == "REPLACE"
+        )
+
+    project = pom_scan.get("project", {})
+    platform = compatibility_report.get("platform", {})
 
     return {
         "planStatus": plan_status,
-        "planningMode": "ANALYSIS_ONLY",
+        "planningMode": policy.get(
+            "executionMode",
+            "ANALYSIS_ONLY",
+        ),
+        "project": project,
+        "platform": {
+            "javaVersion": platform.get("java", {}).get(
+                "configuredVersion"
+            ),
+            "springBootVersion": platform.get("springBoot", {}).get(
+                "configuredVersion"
+            ),
+            "springFrameworkVersion": platform.get(
+                "springFramework",
+                {},
+            ).get("configuredVersion"),
+            "namespace": platform.get("namespace"),
+        },
         "build": {
             "status": build_status,
             "classification": build_classification,
@@ -254,48 +360,52 @@ def create_plan(
             "affectedFiles": build_analysis.get("affectedFiles", []),
             "dependencyFailureConfirmed": dependency_failure_confirmed,
         },
-        "project": pom_scan.get("project", {}),
-        "platform": {
-            "javaVersion": java_info.get("value"),
-            "springBootVersion": spring_boot_info.get("version"),
-            "namespace": (
-                compatibility_report.get("platform", {}).get("namespace")
-                if compatibility_report
-                else None
-            ),
-        },
         "research": {
             "status": research_report.get("researchStatus"),
+            "completedCount": research_report.get(
+                "researchCompletedCount",
+                0,
+            ),
+            "pendingCount": research_report.get(
+                "researchPendingCount",
+                0,
+            ),
+            "migrationCandidateCount": len(migration_candidates),
             "internetResearchPerformed": research_report.get(
                 "internetResearchPerformed",
                 False,
             ),
-            "candidateCount": len(candidate_plans),
         },
         "compatibility": {
-            "platformStatus": (
-                compatibility_report.get("platformStatus")
-                if compatibility_report
-                else "NOT_AVAILABLE"
+            "status": compatibility_report.get("analysisStatus"),
+            "platformStatus": compatibility_report.get("platformStatus"),
+            "compatibleCandidateCount": compatibility_report.get(
+                "compatibleCandidateCount",
+                0,
             ),
-            "automaticMigrationAllowedByCompatibility": (
-                compatibility_report.get("automaticMigrationAllowed", False)
-                if compatibility_report
-                else False
+            "allMigrationCandidatesCompatible": (
+                all_migration_candidates_compatible
             ),
         },
         "migrationCandidates": candidate_plans,
-        "actionSummary": action_counts,
-        "readyCandidateCount": len(ready_candidates),
+        "replacementGroups": replacement_groups,
+        "actionSummary": action_summary,
+        "remediationEligible": remediation_eligible,
+        "policyAllowsAutomaticChanges": policy_allows_changes,
+        "policyAllowsBranchCreation": policy_allows_branch,
         "automaticChangesAllowed": automatic_changes_allowed,
-        "branchCreationAllowed": False,
-        "sourceModificationAllowed": False,
+        "branchCreationAllowed": branch_creation_allowed,
+        "sourceModificationAllowed": automatic_changes_allowed,
+        "pullRequestCreationAllowed": (
+            branch_creation_allowed
+            and policy.get("allowPullRequestCreation", False)
+        ),
         "nextStep": next_step,
     }
 
 
 def write_report(plan, output_file):
-    """Write the migration plan as formatted JSON."""
+    """Write migration-plan.json."""
 
     output_path = Path(output_file).resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -312,11 +422,7 @@ def print_summary(plan, report_path):
     print("=" * 60)
     print("MIGRATION PLAN")
     print("=" * 60)
-    print(
-        "Plan status         : {}".format(
-            plan.get("planStatus")
-        )
-    )
+    print("Plan status         : {}".format(plan.get("planStatus")))
     print(
         "Build status        : {}".format(
             plan.get("build", {}).get("status")
@@ -328,13 +434,31 @@ def print_summary(plan, report_path):
         )
     )
     print(
-        "Candidates          : {}".format(
-            plan.get("research", {}).get("candidateCount", 0)
+        "Failure confirmed   : {}".format(
+            plan.get("build", {}).get("dependencyFailureConfirmed")
         )
     )
     print(
-        "Ready candidates    : {}".format(
-            plan.get("readyCandidateCount", 0)
+        "Migration candidates: {}".format(
+            plan.get("research", {}).get("migrationCandidateCount", 0)
+        )
+    )
+    print(
+        "Compatible          : {}".format(
+            plan.get("compatibility", {}).get(
+                "compatibleCandidateCount",
+                0,
+            )
+        )
+    )
+    print(
+        "Replacement groups  : {}".format(
+            len(plan.get("replacementGroups", []))
+        )
+    )
+    print(
+        "Remediation eligible: {}".format(
+            plan.get("remediationEligible")
         )
     )
     print(
@@ -347,47 +471,66 @@ def print_summary(plan, report_path):
             plan.get("branchCreationAllowed")
         )
     )
-    print(
-        "Next step           : {}".format(
-            plan.get("nextStep")
-        )
-    )
-    print(
-        "Report              : {}".format(
-            report_path
-        )
-    )
+
+    print("Concrete replacements:")
+
+    replacement_groups = plan.get("replacementGroups", [])
+
+    if replacement_groups:
+        for group in replacement_groups:
+            old_dependencies = ", ".join(
+                dependency.get("identifier")
+                for dependency in group.get("currentDependencies", [])
+            )
+            replacement = group.get("replacement", {})
+            print(
+                "  - [{}] -> {}:{}".format(
+                    old_dependencies,
+                    replacement.get("identifier"),
+                    replacement.get("version"),
+                )
+            )
+    else:
+        print("  - None")
+
+    print("Next step           : {}".format(plan.get("nextStep")))
+    print("Report              : {}".format(report_path))
 
 
 def main():
     """Command-line entry point."""
 
     parser = argparse.ArgumentParser(
-        description="Create a safe draft dependency migration plan."
+        description="Create a concrete dependency migration plan."
     )
     parser.add_argument(
         "--build-analysis",
-        default="migration-agent/reports/build-analysis.json",
+        default=str(DEFAULT_BUILD_ANALYSIS),
         help="Path to build-analysis.json.",
     )
     parser.add_argument(
         "--pom-scan",
-        default="migration-agent/reports/pom-scan.json",
+        default=str(DEFAULT_POM_SCAN),
         help="Path to pom-scan.json.",
     )
     parser.add_argument(
         "--research",
-        default="migration-agent/reports/dependency-research.json",
+        default=str(DEFAULT_RESEARCH),
         help="Path to dependency-research.json.",
     )
     parser.add_argument(
         "--compatibility",
-        default="migration-agent/reports/compatibility-report.json",
+        default=str(DEFAULT_COMPATIBILITY),
         help="Path to compatibility-report.json.",
     )
     parser.add_argument(
+        "--policy",
+        default=str(DEFAULT_POLICY),
+        help="Path to policy.json.",
+    )
+    parser.add_argument(
         "--output",
-        default="migration-agent/reports/migration-plan.json",
+        default=str(DEFAULT_OUTPUT),
         help="Path for migration-plan.json.",
     )
 
@@ -397,21 +540,19 @@ def main():
         build_analysis = load_json(
             args.build_analysis,
             "Build analysis report",
-            required=True,
         )
-        pom_scan = load_json(
-            args.pom_scan,
-            "POM scan report",
-            required=True,
-        )
+        pom_scan = load_json(args.pom_scan, "POM scan report")
         research_report = load_json(
             args.research,
             "Dependency research report",
-            required=True,
         )
         compatibility_report = load_json(
             args.compatibility,
             "Compatibility report",
+        )
+        policy = load_json(
+            args.policy,
+            "Agent policy",
             required=False,
         )
 
@@ -420,6 +561,7 @@ def main():
             pom_scan,
             research_report,
             compatibility_report,
+            policy,
         )
         report_path = write_report(plan, args.output)
         print_summary(plan, report_path)
