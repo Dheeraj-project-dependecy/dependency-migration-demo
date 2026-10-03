@@ -1,15 +1,13 @@
 """
-Dependency Migration Agent Orchestrator.
+Orchestrate the Self-Healing Legacy Dependency Migration Agent pipeline.
 
-Runs all framework stages sequentially.
+The orchestrator:
+- loads and validates policy.json
+- runs every agent stage in sequence
+- stops immediately when a required stage fails
+- prints a consolidated final summary
 
-Current execution mode:
-- analysis only
-- planning only
-- no dependency modifications
-- no Git branch creation
-- no source-code changes
-- no pull-request creation
+Current safety mode is controlled by policy.json.
 """
 
 import json
@@ -70,6 +68,11 @@ STEPS = [
         "arguments": [],
     },
     {
+        "name": "Validation Engine",
+        "script": "validation_engine.py",
+        "arguments": [],
+    },
+    {
         "name": "Branch Manager",
         "script": "branch_manager.py",
         "arguments": [],
@@ -92,27 +95,19 @@ def load_policy():
 
     if not POLICY_FILE.exists():
         raise FileNotFoundError(
-            "Agent policy file was not found: {}".format(
-                POLICY_FILE
-            )
+            "Agent policy file was not found: {}".format(POLICY_FILE)
         )
 
     if not POLICY_FILE.is_file():
         raise ValueError(
-            "Agent policy path is not a file: {}".format(
-                POLICY_FILE
-            )
+            "Agent policy path is not a file: {}".format(POLICY_FILE)
         )
 
     try:
-        policy = json.loads(
-            POLICY_FILE.read_text(encoding="utf-8")
-        )
+        policy = json.loads(POLICY_FILE.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise ValueError(
-            "Agent policy contains invalid JSON: {}".format(
-                error
-            )
+            "Agent policy contains invalid JSON: {}".format(error)
         )
 
     required_fields = [
@@ -140,6 +135,20 @@ def load_policy():
     return policy
 
 
+def load_json_report(report_name):
+    """Load a generated JSON report when it exists and is valid."""
+
+    report_path = REPORTS_ROOT / report_name
+
+    if not report_path.exists() or not report_path.is_file():
+        return None
+
+    try:
+        return json.loads(report_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+
+
 def build_command(step):
     """Build the Python command for one agent stage."""
 
@@ -147,23 +156,20 @@ def build_command(step):
 
     if not script_path.exists():
         raise FileNotFoundError(
-            "Agent module was not found: {}".format(
-                script_path
-            )
+            "Agent module was not found: {}".format(script_path)
         )
 
     command = [
         sys.executable,
         str(script_path),
     ]
-
     command.extend(step.get("arguments", []))
 
     return command
 
 
 def execute_step(step_number, total_steps, step):
-    """Execute one agent stage and return its result."""
+    """Execute one agent stage and return structured status metadata."""
 
     print()
     print("-" * 60)
@@ -178,7 +184,6 @@ def execute_step(step_number, total_steps, step):
 
     try:
         command = build_command(step)
-
         result = subprocess.run(
             command,
             cwd=str(PROJECT_ROOT),
@@ -186,30 +191,18 @@ def execute_step(step_number, total_steps, step):
             stderr=None,
             shell=False,
         )
-
     except FileNotFoundError as error:
-        print(
-            "FAILED: {}".format(
-                step["name"]
-            )
-        )
+        print("FAILED: {}".format(step["name"]))
         print("Reason: {}".format(error))
-
         return {
             "name": step["name"],
             "status": "FAILED",
             "exitCode": 2,
             "error": str(error),
         }
-
     except Exception as error:
-        print(
-            "FAILED: {}".format(
-                step["name"]
-            )
-        )
+        print("FAILED: {}".format(step["name"]))
         print("Reason: {}".format(error))
-
         return {
             "name": step["name"],
             "status": "FAILED",
@@ -219,17 +212,8 @@ def execute_step(step_number, total_steps, step):
 
     if result.returncode != 0:
         print()
-        print(
-            "FAILED: {}".format(
-                step["name"]
-            )
-        )
-        print(
-            "Exit code: {}".format(
-                result.returncode
-            )
-        )
-
+        print("FAILED: {}".format(step["name"]))
+        print("Exit code: {}".format(result.returncode))
         return {
             "name": step["name"],
             "status": "FAILED",
@@ -238,11 +222,7 @@ def execute_step(step_number, total_steps, step):
         }
 
     print()
-    print(
-        "SUCCESS: {}".format(
-            step["name"]
-        )
-    )
+    print("SUCCESS: {}".format(step["name"]))
 
     return {
         "name": step["name"],
@@ -252,24 +232,8 @@ def execute_step(step_number, total_steps, step):
     }
 
 
-def load_json_report(report_name):
-    """Load a generated JSON report if available."""
-
-    report_path = REPORTS_ROOT / report_name
-
-    if not report_path.exists():
-        return None
-
-    try:
-        return json.loads(
-            report_path.read_text(encoding="utf-8")
-        )
-    except json.JSONDecodeError:
-        return None
-
-
 def print_startup(policy):
-    """Print policy-driven agent startup information."""
+    """Print policy-driven startup information."""
 
     agent_name = policy.get(
         "agentName",
@@ -279,34 +243,22 @@ def print_startup(policy):
     print("=" * 60)
     print(agent_name.upper())
     print("=" * 60)
-    print(
-        "Agent name          : {}".format(
-            agent_name
-        )
-    )
-    print(
-        "Agent version       : {}".format(
-            policy.get("version")
-        )
-    )
-    print(
-        "Execution mode      : {}".format(
-            policy.get("executionMode")
-        )
-    )
+    print("Agent name          : {}".format(agent_name))
+    print("Agent version       : {}".format(policy.get("version")))
+    print("Execution mode      : {}".format(policy.get("executionMode")))
     print(
         "Automatic changes   : {}".format(
-            policy.get("allowAutomaticChanges")
+            policy.get("allowAutomaticChanges", False)
         )
     )
     print(
         "Branch creation     : {}".format(
-            policy.get("allowBranchCreation")
+            policy.get("allowBranchCreation", False)
         )
     )
     print(
         "Pull request        : {}".format(
-            policy.get("allowPullRequestCreation")
+            policy.get("allowPullRequestCreation", False)
         )
     )
     print(
@@ -319,144 +271,117 @@ def print_startup(policy):
             policy.get("minimumConfidenceScore")
         )
     )
-    print(
-        "Project root        : {}".format(
-            PROJECT_ROOT
-        )
-    )
-    print(
-        "Agent root          : {}".format(
-            AGENT_ROOT
-        )
-    )
+    print("Project root        : {}".format(PROJECT_ROOT))
+    print("Agent root          : {}".format(AGENT_ROOT))
 
 
 def print_final_summary(step_results, policy):
     """Print the final agent execution summary."""
 
-    migration_plan = load_json_report(
-        "migration-plan.json"
-    )
-    remediation_report = load_json_report(
-        "remediation-report.json"
-    )
-    branch_report = load_json_report(
-        "branch-report.json"
-    )
-    final_report = load_json_report(
-        "final-agent-report.json"
-    )
+    migration_plan = load_json_report("migration-plan.json") or {}
+    remediation_report = load_json_report("remediation-report.json") or {}
+    validation_report = load_json_report("validation-report.json") or {}
+    branch_report = load_json_report("branch-report.json") or {}
+    final_report = load_json_report("final-agent-report.json") or {}
 
     successful_steps = [
         step
         for step in step_results
-        if step["status"] == "SUCCESS"
+        if step.get("status") == "SUCCESS"
     ]
-
     failed_steps = [
         step
         for step in step_results
-        if step["status"] == "FAILED"
+        if step.get("status") == "FAILED"
     ]
+
+    migration_research = migration_plan.get("research", {})
+    final_summary = final_report.get("summary", {})
+    final_validation = final_report.get("validation", {})
+
+    migration_candidate_count = migration_research.get(
+        "migrationCandidateCount",
+        final_summary.get("migrationCandidateCount", 0),
+    )
+    final_next_step = final_summary.get(
+        "nextStep",
+        migration_plan.get("nextStep", "No next step was provided."),
+    )
 
     print()
     print("=" * 60)
     print("AGENT EXECUTION SUMMARY")
     print("=" * 60)
+    print("Agent version       : {}".format(policy.get("version")))
+    print("Execution mode      : {}".format(policy.get("executionMode")))
+    print("Successful steps    : {}".format(len(successful_steps)))
+    print("Failed steps        : {}".format(len(failed_steps)))
     print(
-        "Agent version       : {}".format(
-            policy.get("version")
+        "Plan status         : {}".format(
+            migration_plan.get("planStatus", "UNKNOWN")
         )
     )
     print(
-        "Execution mode      : {}".format(
-            policy.get("executionMode")
+        "Automatic changes   : {}".format(
+            migration_plan.get("automaticChangesAllowed", False)
         )
     )
     print(
-        "Successful steps    : {}".format(
-            len(successful_steps)
+        "Branch creation     : {}".format(
+            migration_plan.get("branchCreationAllowed", False)
         )
     )
     print(
-        "Failed steps        : {}".format(
-            len(failed_steps)
+        "Migration candidates: {}".format(
+            migration_candidate_count
         )
     )
-
-    if migration_plan:
-        print(
-            "Plan status         : {}".format(
-                migration_plan.get("planStatus")
-            )
-        )
-        print(
-            "Automatic changes   : {}".format(
-                migration_plan.get(
-                    "automaticChangesAllowed",
-                    False,
-                )
-            )
-        )
-        print(
-            "Branch creation     : {}".format(
-                migration_plan.get(
-                    "branchCreationAllowed",
-                    False,
-                )
-            )
-        )
-        print(
-            "Migration candidates: {}".format(
-                migration_plan.get(
-                    "research",
-                    {},
-                ).get(
-                    "candidateCount",
-                    0,
-                )
-            )
-        )
-
-    if remediation_report:
-        print(
-            "Remediation status  : {}".format(
-                remediation_report.get("status")
-            )
-        )
-
-    if branch_report:
-        print(
-            "Branch required     : {}".format(
-                branch_report.get(
-                    "branchRequired",
-                    False,
-                )
-            )
-        )
-        print(
-            "Branch name         : {}".format(
-                branch_report.get("branchName")
-            )
-        )
-
-    if final_report:
-        print(
-            "Final agent status  : {}".format(
-                final_report.get("agentStatus")
-            )
-        )
-        print(
-            "Final next step     : {}".format(
-                final_report.get("nextStep")
-            )
-        )
-
     print(
-        "Reports directory    : {}".format(
-            REPORTS_ROOT
+        "Remediation status  : {}".format(
+            remediation_report.get("status", "UNKNOWN")
         )
     )
+    print(
+        "Validation status   : {}".format(
+            validation_report.get(
+                "validationStatus",
+                final_validation.get("status", "NOT_EXECUTED"),
+            )
+        )
+    )
+    print(
+        "Tests run           : {}".format(
+            validation_report.get("tests", {}).get(
+                "tests",
+                final_validation.get("testsRun", 0),
+            )
+        )
+    )
+    print(
+        "Coverage generated  : {}".format(
+            validation_report.get("coverage", {}).get(
+                "reportFound",
+                final_validation.get("coverageGenerated", False),
+            )
+        )
+    )
+    print(
+        "Branch required     : {}".format(
+            branch_report.get("branchRequired", False)
+        )
+    )
+    print(
+        "Branch name         : {}".format(
+            branch_report.get("branchName")
+        )
+    )
+    print(
+        "Final agent status  : {}".format(
+            final_report.get("agentStatus", "UNKNOWN")
+        )
+    )
+    print("Final next step     : {}".format(final_next_step))
+    print("Reports directory    : {}".format(REPORTS_ROOT))
 
     if failed_steps:
         print()
@@ -465,14 +390,14 @@ def print_final_summary(step_results, policy):
         for failed_step in failed_steps:
             print(
                 "  - {} (exit code {})".format(
-                    failed_step["name"],
-                    failed_step["exitCode"],
+                    failed_step.get("name"),
+                    failed_step.get("exitCode"),
                 )
             )
 
 
 def validate_environment():
-    """Validate files required before execution."""
+    """Validate files required before agent execution."""
 
     required_files = [
         PROJECT_ROOT / "pom.xml",
@@ -490,11 +415,21 @@ def validate_environment():
         print("Missing required files:")
 
         for missing_file in missing_files:
-            print(
-                "  - {}".format(
-                    missing_file
-                )
-            )
+            print("  - {}".format(missing_file))
+
+        return False
+
+    missing_modules = [
+        str(AGENT_ROOT / step["script"])
+        for step in STEPS
+        if not (AGENT_ROOT / step["script"]).exists()
+    ]
+
+    if missing_modules:
+        print("Missing agent modules:")
+
+        for missing_module in missing_modules:
+            print("  - {}".format(missing_module))
 
         return False
 
@@ -502,7 +437,7 @@ def validate_environment():
 
 
 def main():
-    """Run the complete agent framework sequentially."""
+    """Run the complete agent pipeline sequentially."""
 
     try:
         policy = load_policy()
@@ -510,70 +445,40 @@ def main():
         print("=" * 60)
         print("DEPENDENCY MIGRATION AGENT")
         print("=" * 60)
-        print(
-            "Unable to load policy: {}".format(
-                error
-            )
-        )
+        print("Unable to load policy: {}".format(error))
         return 2
 
+    REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
     print_startup(policy)
-
-    REPORTS_ROOT.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
 
     if not validate_environment():
         print()
         print(
-            "Agent execution stopped because required "
-            "input files are missing."
+            "Agent execution stopped because required inputs are missing."
         )
         return 2
 
-    total_steps = len(STEPS)
     step_results = []
+    total_steps = len(STEPS)
 
-    for index, step in enumerate(
-        STEPS,
-        start=1,
-    ):
-        result = execute_step(
-            index,
-            total_steps,
-            step,
-        )
-
+    for index, step in enumerate(STEPS, start=1):
+        result = execute_step(index, total_steps, step)
         step_results.append(result)
 
-        if result["status"] == "FAILED":
+        if result.get("status") == "FAILED":
             print()
             print("=" * 60)
             print("AGENT PIPELINE STOPPED")
             print("=" * 60)
-            print(
-                "Failed stage       : {}".format(
-                    result["name"]
-                )
-            )
-
-            print_final_summary(
-                step_results,
-                policy,
-            )
-
-            return result["exitCode"] or 1
+            print("Failed stage       : {}".format(result.get("name")))
+            print_final_summary(step_results, policy)
+            return result.get("exitCode") or 1
 
     print()
     print("=" * 60)
     print("AGENT EXECUTION COMPLETE")
     print("=" * 60)
-
-    print_final_summary(
-        step_results,
-        policy,
-    )
+    print_final_summary(step_results, policy)
 
     return 0
 
