@@ -63,14 +63,19 @@ STEPS = [
         "arguments": [],
     },
     {
-        "name": "Remediation Engine",
-        "script": "remediation_engine.py",
-        "arguments": [],
+    "name": "Remediation Engine",
+    "script": "remediation_engine.py",
+    "arguments": [],
     },
     {
-        "name": "Validation Engine",
-        "script": "validation_engine.py",
-        "arguments": [],
+    "name": "Source Remediator",
+    "script": "source_remediator.py",
+    "arguments": ["--dry-run"],
+    },
+    {
+    "name": "Validation Engine",
+    "script": "validation_engine.py",
+    "arguments": [],
     },
     {
         "name": "Branch Manager",
